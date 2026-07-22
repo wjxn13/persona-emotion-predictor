@@ -168,7 +168,8 @@ def main():
     gradient_accumulation_steps = 1
     epochs = 3
     learning_rate = 2e-5
-    dataloader_num_workers = 4
+    # Windows 下多进程 DataLoader 易卡死，自动降级为 0；Linux 保持 4 加速
+    dataloader_num_workers = 0 if os.name == "nt" else 4
     # ===========================================
 
     # 读取数据
