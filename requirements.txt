@@ -1,0 +1,8 @@
+# 运行依赖（Python 3.11+）
+torch
+transformers
+pandas
+numpy
+scikit-learn
+deep_translator
+safetensors

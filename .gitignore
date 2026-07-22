@@ -27,3 +27,7 @@ Thumbs.db
 
 # 其他
 checkpoint-*
+
+# 误提交与缓存
+*.lnk
+.hf_cache/
