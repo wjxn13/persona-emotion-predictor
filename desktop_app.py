@@ -21,6 +21,9 @@ import re
 import logging
 import json
 from datetime import datetime
+import csv
+import tkinter.ttk as ttk
+from collections import Counter
 
 # 直接导入 distilbert 具体类，不触发 sklearn/accelerate 依赖
 from transformers import DistilBertTokenizerFast, DistilBertConfig, DistilBertModel
@@ -209,6 +212,11 @@ class EmotionApp:
         tk.Button(root, text="预测情绪", command=self.predict, font=("微软雅黑", 10),
                   bg="#4CAF50", fg="white").pack(pady=10)
 
+        # 性格扫描 Demo 入口
+        tk.Button(root, text="🎯 性格扫描 Demo（看性格如何改变情绪）",
+                  command=self.open_scan_demo, font=("微软雅黑", 10),
+                  bg="#534AB7", fg="white").pack(pady=(0, 6))
+
         # 翻译结果显示
         tk.Label(root, text="翻译结果 (英文):", font=("微软雅黑", 10)).pack(pady=(5, 0))
         self.translated_text = tk.Text(root, height=2, width=55, font=("Consolas", 10), state="disabled", bg="#f0f0f0")
@@ -354,6 +362,206 @@ class EmotionApp:
         self.prob_text.delete("1.0", tk.END)
         self.prob_text.insert("1.0", "\n".join(lines))
         self.prob_text.config(state="disabled")
+
+    # ============ 性格扫描 Demo：固定事件+领域，扫 BFI 一维看 7 类情绪曲线 ============
+    def open_scan_demo(self):
+        ScanDemoWindow(self.root, self)
+
+
+# ================= 性格扫描 / 标注者分布 Demo 窗口 =================
+class ScanDemoWindow:
+    TRAITS = ["开放性 Openness", "尽责性 Conscientiousness", "外向性 Extraversion",
+              "宜人性 Agreeableness", "神经质 Neuroticism"]
+    TRAIT_KEYS = ["open", "cons", "extr", "agre", "neur"]
+    EVENTS = [
+        ("被 Wheelchair 碾过（自嘲没存在感）", "Today, I got run over. Not by a car, but by a lady in a wheelchair..."),
+        ("前男友结婚，新娘是当年吵架那个", "Today, my ex-boyfriend got married. Normally this wouldn't bother me... had his bride not been the girl we constantly argued about..."),
+        ("球衣被印上 NO NAME 还多收费", "Today, I received my soccer team jacket... My jacket now has 'NO NAME' spelled out on it..."),
+        ("股市暴跌，投资全亏", "The stock market crashed today and I lost all my investments."),
+        ("中彩票大奖", "I just won the lottery and became a millionaire!"),
+    ]
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.scan_cache = {}
+        win = tk.Toplevel(parent)
+        win.title("🎯 性格扫描 Demo")
+        win.geometry("900x720")
+        win.resizable(False, False)
+        self.win = win
+
+        # 顶部：事件选择
+        top = tk.Frame(win)
+        top.pack(fill="x", padx=10, pady=8)
+        tk.Label(top, text="事件：", font=("微软雅黑", 10)).pack(side="left")
+        self.event_var = tk.StringVar(value=self.EVENTS[0][0])
+        cb = ttk.Combobox(top, textvariable=self.event_var, width=58, font=("微软雅黑", 9), state="readonly")
+        cb["values"] = [e[0] for e in self.EVENTS]
+        cb.pack(side="left", padx=6)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+
+        # 领域选择（仅 V2）
+        dom_frame = tk.Frame(top)
+        dom_frame.pack(fill="x", padx=10, pady=2)
+        tk.Label(dom_frame, text="领域：", font=("微软雅黑", 10)).pack(side="left")
+        self.scan_domain_var = tk.StringVar(value="Social Media")
+        for d in DOMAIN_LIST:
+            tk.Radiobutton(dom_frame, text=d, variable=self.scan_domain_var, value=d,
+                           font=("微软雅黑", 9), command=self.refresh).pack(side="left", padx=8)
+
+        # 扫描维度选择
+        dim_frame = tk.Frame(win)
+        dim_frame.pack(fill="x", padx=10, pady=2)
+        tk.Label(dim_frame, text="扫描维度：", font=("微软雅黑", 10)).pack(side="left")
+        self.scan_dim = tk.StringVar(value=self.TRAITS[4])
+        for t in self.TRAITS:
+            tk.Radiobutton(dim_frame, text=t, variable=self.scan_dim, value=t,
+                           font=("微软雅黑", 9), command=self.refresh).pack(side="left", padx=6)
+
+        # 控制：固定其余四维
+        ctrl = tk.Frame(win)
+        ctrl.pack(fill="x", padx=10, pady=2)
+        tk.Label(ctrl, text="其余四维固定值：", font=("微软雅黑", 9)).pack(side="left")
+        self.base_var = tk.DoubleVar(value=0.5)
+        tk.Scale(ctrl, variable=self.base_var, from_=0.0, to=1.0, resolution=0.05,
+                 orient=tk.HORIZONTAL, length=160, font=("微软雅黑", 9),
+                 command=lambda v: self.refresh()).pack(side="left", padx=6)
+
+        # 画布
+        self.canvas = tk.Canvas(win, bg="white", height=360, width=860)
+        self.canvas.pack(fill="x", padx=10, pady=6)
+
+        # 解释
+        self.note = tk.Text(win, height=4, width=110, font=("微软雅黑", 9), state="disabled", bg="#f6f6f6")
+        self.note.pack(padx=10, pady=4)
+
+        # 36 标注者分布按钮
+        tk.Button(win, text="📊 显示该事件 36 名标注者真实情绪投票", command=self.show_annotators,
+                  font=("微软雅黑", 9), bg="#1D9E75", fg="white").pack(pady=4)
+
+        self.refresh()
+
+    def _scan(self, event_text, domain_name, dim_idx, base):
+        key = (event_text, domain_name, dim_idx, round(base, 2))
+        if key in self.scan_cache:
+            return self.scan_cache[key]
+        bfi = [base] * 5
+        feats = ScanDemoWindow.TRAIT_KEYS
+        enc = tokenizer(event_text, truncation=True, padding="max_length", max_length=64, return_tensors="pt")
+        domain_vec = None
+        if domain_enabled:
+            didx = DOMAIN_LIST.index(domain_name)
+            domain_vec = torch.zeros(1, len(DOMAIN_LIST))
+            domain_vec[0, didx] = 1.0
+        curves = {emo: [] for emo in EMOTIONS}
+        with torch.no_grad():
+            for s in np.linspace(0.0, 1.0, 21):
+                bfi[dim_idx] = float(s)
+                out = model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"],
+                            bfi=torch.tensor([bfi], dtype=torch.float), domain=domain_vec)
+                probs = torch.softmax(out.logits, dim=-1).squeeze().tolist()
+                for emo, p in zip(EMOTIONS, probs):
+                    curves[emo].append(p)
+        self.scan_cache[key] = curves
+        return curves
+
+    def refresh(self):
+        event_text = dict(self.EVENTS)[self.event_var.get()]
+        domain_name = self.scan_domain_var.get()
+        dim_idx = self.TRAITS.index(self.scan_dim.get())
+        base = self.base_var.get()
+        curves = self._scan(event_text, domain_name, dim_idx, base)
+
+        W, H = 860, 360
+        pad_l, pad_r, pad_t, pad_b = 60, 20, 20, 45
+        cw, ch = W - pad_l - pad_r, H - pad_t - pad_b
+        cv = self.canvas
+        cv.delete("all")
+        # 背景网格 + Y 轴刻度
+        for i in range(6):
+            y = pad_t + ch * i / 5
+            cv.create_line(pad_l, y, W - pad_r, y, fill="#e0e0e0")
+            cv.create_text(pad_l - 8, y, text=f"{100 - i * 20}%", anchor="e", font=("微软雅黑", 8), fill="#888")
+        # 曲线
+        n = 21
+        colors = ["#E24B4A", "#BA7517", "#854F0B", "#639922", "#5F5E5A", "#378ADD", "#534AB7"]
+        for idx, emo in enumerate(EMOTIONS):
+            pts = []
+            for j in range(n):
+                x = pad_l + cw * j / (n - 1)
+                y = pad_t + ch * (1 - curves[emo][j])
+                pts.append((x, y))
+            cv.create_line(*[c for p in pts for c in p], fill=colors[idx % len(colors)], width=2, smooth=True)
+        # 图例
+        lx = pad_l + 5
+        for idx, emo in enumerate(EMOTIONS):
+            y = pad_t + 6 + idx * 16
+            cv.create_rectangle(lx, y, lx + 12, y + 10, fill=colors[idx % len(colors)], outline="")
+            cv.create_text(lx + 16, y + 5, text=f"{emo}", anchor="w", font=("微软雅黑", 9), fill="#333")
+        # X 轴标签
+        cv.create_text((pad_l + W - pad_r) / 2, H - 12, text=f"{self.scan_dim.get()} 从 0.0 → 1.0",
+                       font=("微软雅黑", 9), fill="#333")
+
+        # 解释文字（诚实版：distilbert 轻量底座下性格利用率有限，曲线摆幅小是真实局限）
+        argmax_0 = max(EMOTIONS, key=lambda e: curves[e][0])
+        argmax_1 = max(EMOTIONS, key=lambda e: curves[e][-1])
+        max_swing = max((max(curves[e]) - min(curves[e])) * 100 for e in EMOTIONS)
+        self.note.config(state="normal")
+        self.note.delete("1.0", tk.END)
+        self.note.insert("1.0",
+            f"横轴为「{self.scan_dim.get()}」从 0 到 1 连续扫描，其余四维固定 {base:.2f}；领域={domain_name}。\n"
+            f"主导情绪在 {self.scan_dim.get()}=0.0 时为 {argmax_0}（{curves[argmax_0][0]*100:.1f}%），"
+            f"=1.0 时为 {argmax_1}（{curves[argmax_1][-1]*100:.1f}%）；整条曲线最大摆幅仅 {max_swing:.1f}pp。\n"
+            f"曲线较平说明：当前轻量模型对性格的利用率有限，情绪主要由事件语义决定——这与数据集里"
+            f"「同一事件 36 人标注情绪常不一致」（personality illusion）是同一难题的两面。换 bert-base 底座可放大性格效应。")
+        self.note.config(state="disabled")
+
+    def show_annotators(self):
+        # 在数据集里按 english_item 模糊匹配，聚合 36 标注者真实情绪投票
+        event_text = dict(self.EVENTS)[self.event_var.get()]
+        base = os.path.dirname(os.path.abspath(__file__))
+        csv_path = os.path.join(base, "基于性格建模的文本情绪反应预测", "1_dataset_all_annotators.csv")
+        votes = Counter()
+        if not os.path.exists(csv_path):
+            messagebox.showinfo("提示", "未找到数据集 1_dataset_all_annotators.csv，无法展示标注者分布。")
+            return
+        try:
+            with open(csv_path, encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row["english_item"].strip().startswith(event_text.split("（")[0][:20]):
+                        for i in range(1, 37):
+                            e = row.get(f"E{i}_emotion")
+                            if e:
+                                votes[e.strip().lower()] += 1
+                        break
+        except Exception as ex:
+            messagebox.showerror("错误", f"读取数据集失败：{ex}")
+            return
+
+        top = tk.Toplevel(self.win)
+        top.title("36 名标注者真实情绪投票")
+        top.geometry("560x420")
+        top.resizable(False, False)
+        tk.Label(top, text=f"事件：{event_text}", font=("微软雅黑", 9), wraplength=520, justify="left").pack(padx=10, pady=6)
+        tk.Label(top, text="同一事件，36 名标注者给出的情绪并不一致 —— 这正是预测准确率上限只有约 35% 的原因（personality illusion）。",
+                 font=("微软雅黑", 9), fg="#888", wraplength=520, justify="left").pack(padx=10, pady=4)
+        cv2 = tk.Canvas(top, bg="white", height=320, width=520)
+        cv2.pack(padx=10, pady=6)
+        if not votes:
+            cv2.create_text(260, 160, text="（该事件未在数据集中精确匹配到标注记录）", font=("微软雅黑", 10), fill="#999")
+            return
+        maxv = max(votes.values())
+        palette = ["#E24B4A", "#BA7517", "#854F0B", "#639922", "#5F5E5A", "#378ADD", "#534AB7"]
+        order = EMOTIONS
+        bh = 320 / max(len(order), 1)
+        for i, emo in enumerate(order):
+            v = votes.get(emo, 0)
+            w = (v / maxv) * 420 if maxv else 0
+            y = i * bh + 10
+            cv2.create_rectangle(120, y, 120 + w, y + bh - 8, fill=palette[i % len(palette)], outline="")
+            cv2.create_text(112, y + bh / 2 - 4, text=EMO, anchor="e", font=("微软雅黑", 9), fill="#333")
+            cv2.create_text(126 + w, y + bh / 2 - 4, text=str(v), anchor="w", font=("微软雅黑", 9), fill="#333")
 
 
 if __name__ == "__main__":
