@@ -5,9 +5,10 @@ total_start = time.time()
 
 # ===== 环境变量（必须在导入 torch 前设置） =====
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# 暂时允许联网下载翻译模型缓存（首次需要），之后可改为 "1" 彻底离线
-os.environ["HF_HUB_OFFLINE"] = "0"
-os.environ["TRANSFORMERS_OFFLINE"] = "0"
+# 尊重启动脚本（如 .bat）的离线设置：仅当未显式设置时才默认允许联网下载缓存。
+# 已缓存翻译模型后，把 .bat 里的 HF_HUB_OFFLINE=1 打开即可彻底离线运行。
+os.environ.setdefault("HF_HUB_OFFLINE", "0")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
 
 print(f"[计时] 环境变量设置完成，耗时 {time.time() - total_start:.3f} 秒")
 
